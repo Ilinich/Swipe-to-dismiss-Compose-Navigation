@@ -2,6 +2,10 @@
 
 iOS-style swipe-to-dismiss navigation for Jetpack Compose Navigation 3.
 
+<p align="center">
+  <img src="swipe.gif" width="300" alt="Swipe-to-dismiss demo" />
+</p>
+
 ## What it demonstrates
 
 - Horizontal swipe gesture to navigate back (drag from left edge or flick right)

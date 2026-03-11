@@ -3,6 +3,7 @@ package com.begoml.composenav.swipetodismiss
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -86,7 +87,7 @@ private fun SwipeDismissDemo() {
 
     NavDisplay(
         backStack = backStack,
-        onBack = { if (backStack.size > 1) backStack.removeLast() },
+        onBack = { if (backStack.size > 1) backStack.removeAt(backStack.lastIndex) },
         sceneStrategy = SwipeToDismissSceneStrategy() then SinglePaneSceneStrategy(),
         entryProvider = entryProvider {
             entry<HomeKey> { _ ->
@@ -96,10 +97,7 @@ private fun SwipeDismissDemo() {
             }
 
             swipeToDismissHorizontalEntry<DetailKey> { key ->
-                DetailScreen(
-                    key = key,
-                    onBack = { if (backStack.size > 1) backStack.removeLast() },
-                )
+                DetailScreen(key = key)
             }
         },
     )
@@ -151,7 +149,8 @@ private fun HomeScreen(onItemClick: (DetailKey) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DetailScreen(key: DetailKey, onBack: () -> Unit) {
+private fun DetailScreen(key: DetailKey) {
+    val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
     val color = screenColors[key.id % screenColors.size]
 
     Scaffold(
@@ -159,7 +158,7 @@ private fun DetailScreen(key: DetailKey, onBack: () -> Unit) {
             TopAppBar(
                 title = { Text(key.title) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = { backDispatcher?.onBackPressed() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
