@@ -24,6 +24,7 @@ internal data class SwipeToDismissScene(
     val previousEntry: NavEntry<NavKey>,
     val currentEntry: NavEntry<NavKey>,
     override val previousEntries: List<NavEntry<NavKey>>,
+    val freezeBackgroundWhileIdle: Boolean,
     val onBack: () -> Unit,
 ) : Scene<NavKey> {
 
@@ -34,6 +35,7 @@ internal data class SwipeToDismissScene(
             onDismiss = onBack,
             backgroundContent = { previousEntry.Content() },
             foregroundContent = { currentEntry.Content() },
+            freezeBackgroundWhileIdle = freezeBackgroundWhileIdle,
         )
     }
 

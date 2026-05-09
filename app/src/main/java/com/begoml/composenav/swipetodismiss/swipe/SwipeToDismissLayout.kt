@@ -5,6 +5,8 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
@@ -13,6 +15,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -33,6 +36,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -72,6 +76,13 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  *    is RESUMED. Once a dismiss starts or the scene transitions to STARTED (pop), composition
  *    of [backgroundContent] stops and the cached snapshot is replayed. This avoids
  *    `movableContentOf` conflicts with [SinglePaneScene][androidx.navigation3.scene.SinglePaneScene].
+ *    When [freezeBackgroundWhileIdle] is `true`, the background's CPU draw (`record`), GPU
+ *    draw (`drawLayer`) and measure pass are skipped during RESUMED-idle while a snapshot
+ *    already exists. Background composition stays alive — its `LaunchedEffect` /
+ *    `DisposableEffect` are not disposed, which prevents window-scoped side effects (focus,
+ *    IME) from being torn down on every touch in the foreground. On first touch
+ *    (`awaitFirstDown`) draw / measure resume so the layer is refreshed before parallax
+ *    exposes the background.
  *
  * 2. **Foreground layer** — the current screen. During idle state the content is recorded into
  *    a [GraphicsLayer] snapshot. Once swiping begins (`progress > 0`), only the cached snapshot
@@ -97,14 +108,29 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  * @param onDismiss Called when the swipe gesture completes a dismiss (navigates back).
  * @param backgroundContent Content of the previous screen (rendered behind the foreground).
  * @param foregroundContent Content of the current screen (the one being swiped away).
+ * @param freezeBackgroundWhileIdle When `true`, the background's CPU draw (`record` of the
+ * display-list), GPU draw (`drawLayer`) and measure pass are skipped while the foreground is
+ * RESUMED, idle (no touch / swipe), and a snapshot has already been captured. Background
+ * composition stays alive (`LaunchedEffect` / `DisposableEffect` are not disposed). On first
+ * touch (`awaitFirstDown`) draw and measure resume so the layer is refreshed before the
+ * user's finger moves enough to expose the background. When `false`, background composes
+ * and draws live every frame (legacy behaviour).
+ *
+ * Invariants when this flag is `true`:
+ * - [foregroundContent] must be fully opaque and cover the entire screen. Semi-transparent
+ *   foregrounds will show a black/empty background while idle because draw is skipped.
+ * - The background's measure pass is also skipped while fully covered, so size-aware
+ *   callbacks in [backgroundContent] (`onSizeChanged`, `onGloballyPositioned`, `onPlaced`)
+ *   must guard against zero / empty sizes to remain idempotent across measure-skip cycles.
  * @param modifier Optional modifier for the root container.
  */
 @Composable
-@Suppress("LongMethod")
+@Suppress("LongMethod", "CyclomaticComplexMethod")
 internal fun SwipeToDismissLayout(
     onDismiss: () -> Unit,
     backgroundContent: @Composable () -> Unit,
     foregroundContent: @Composable () -> Unit,
+    freezeBackgroundWhileIdle: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
@@ -225,6 +251,25 @@ internal fun SwipeToDismissLayout(
     val foregroundLayer = rememberGraphicsLayer()
     var hasForegroundSnapshot by remember { mutableStateOf(false) }
 
+    // Background freeze state (active only when freezeBackgroundWhileIdle = true).
+    // hasBackgroundSnapshot: flips true once the first record() pass completes; gate for
+    //   switching from live draw to skip-draw, and prerequisite for skip-measure.
+    // isTouchDown: set on awaitFirstDown via a separate pointerInput on the foreground.
+    //   Pre-warms live draw before detectHorizontalDragGestures slop, so a fresh snapshot is
+    //   captured before the user's finger has moved enough for parallax to expose stale frames.
+    var hasBackgroundSnapshot by remember { mutableStateOf(false) }
+    var isTouchDown by remember { mutableStateOf(false) }
+
+    // Invalidate snapshot when configuration changes that affect rendering. Rotation triggers
+    // full recomposition anyway; uiMode (light/dark), fontScale, locales can change without
+    // recreating the activity, leaving a visually stale snapshot until the next swipe.
+    val configuration = LocalConfiguration.current
+    if (freezeBackgroundWhileIdle) {
+        LaunchedEffect(configuration.uiMode, configuration.fontScale, configuration.locales) {
+            hasBackgroundSnapshot = false
+        }
+    }
+
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -243,6 +288,16 @@ internal fun SwipeToDismissLayout(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val isInteracting = isDragging || isNestedScrollDragging || isSwiping || isTouchDown
+
+    // When true, foreground (assumed fully opaque per the freezeBackgroundWhileIdle invariant)
+    // covers the entire screen and the background is invisible. Skip CPU draw (record), GPU
+    // draw (drawLayer) and measure for the background subtree.
+    // hasBackgroundSnapshot guards the very first frame: at least one record must have run so
+    // that future swipe-parallax has a layer to replay if composition is dropped by lifecycle.
+    val isFullyCoveredByForeground = freezeBackgroundWhileIdle && isResumed &&
+        !isDismissed && !isBeingRemoved && !isInteracting && hasBackgroundSnapshot
+
     Box(modifier = modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
@@ -257,13 +312,45 @@ internal fun SwipeToDismissLayout(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .layout { measurable, constraints ->
+                            if (isFullyCoveredByForeground) {
+                                // Skip measure for the background subtree — children are
+                                // invisible under the foreground, so we don't pay for measure
+                                // invalidations from background state ticks.
+                                // Returning full constraints as the layout size keeps parent
+                                // placement stable; no children are placed, so onPlaced /
+                                // onSizeChanged / onGloballyPositioned do not fire.
+                                // Background composables MUST guard size-dependent state
+                                // against zero size to remain idempotent across measure-skip
+                                // cycles.
+                                layout(constraints.maxWidth, constraints.maxHeight) {}
+                            } else {
+                                val placeable = measurable.measure(constraints)
+                                layout(placeable.width, placeable.height) {
+                                    placeable.place(0, 0)
+                                }
+                            }
+                        }
                         .drawWithContent {
+                            if (isFullyCoveredByForeground) {
+                                // Foreground fully covers the screen — skip CPU display-list
+                                // issuance + GPU layer playback. Composition stays alive, but
+                                // drawContent() is not invoked, eliminating per-frame work
+                                // for an invisible subtree.
+                                return@drawWithContent
+                            }
                             backgroundLayer.record(
                                 size = IntSize(size.width.toInt(), size.height.toInt()),
                             ) {
                                 this@drawWithContent.drawContent()
                             }
                             drawLayer(backgroundLayer)
+                            // Guarded write: only on first record() pass. Avoids scheduling
+                            // a recomposition every draw when freezeBackgroundWhileIdle
+                            // re-enters live draw and hasBackgroundSnapshot is already true.
+                            if (freezeBackgroundWhileIdle && !hasBackgroundSnapshot) {
+                                hasBackgroundSnapshot = true
+                            }
                         }
                 ) {
                     backgroundContent()
@@ -280,6 +367,30 @@ internal fun SwipeToDismissLayout(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .then(
+                    // Pre-warm live draw on first touch (before detectHorizontalDragGestures
+                    // classifies the gesture as a horizontal drag via slop). Gives Compose
+                    // ~50–100 ms head start to refresh the snapshot before parallax translation
+                    // begins to expose the background. Pointer events are not consumed, so
+                    // detectHorizontalDragGestures still sees them.
+                    if (freezeBackgroundWhileIdle) {
+                        Modifier.pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                isTouchDown = true
+                                try {
+                                    do {
+                                        val event = awaitPointerEvent()
+                                    } while (event.changes.any { it.pressed })
+                                } finally {
+                                    isTouchDown = false
+                                }
+                            }
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
                 .nestedScroll(nestedScrollConnection)
                 .pointerInput(Unit) {
                     detectHorizontalDragGestures(

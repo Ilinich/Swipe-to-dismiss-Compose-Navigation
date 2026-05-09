@@ -17,11 +17,24 @@ import androidx.navigation3.ui.NavDisplay
  *
  * Push: slide in from the right.
  * Pop: handled entirely by [SwipeToDismissLayout] — transition metadata is set to None/None.
+ *
+ * @param animationDuration Push slide-in duration in ms.
+ * @param freezeBackgroundWhileIdle When `true`, the background entry's draw and measure work is
+ * skipped while this entry is on top, idle, and fully covers the screen. Background composition
+ * stays alive — its `LaunchedEffect` / `DisposableEffect` are not torn down on foreground
+ * touches, which preserves window-scoped state like input focus and IME visibility. See
+ * [FreezeBackgroundWhileIdle] for invariants and limitations. Default `false`.
  */
 inline fun <reified T : NavKey> EntryProviderScope<NavKey>.swipeToDismissHorizontalEntry(
     animationDuration: Int = 300,
+    freezeBackgroundWhileIdle: Boolean = false,
     noinline content: @Composable (T) -> Unit,
 ) {
+    val freezeMetadata: Map<String, Any> = if (freezeBackgroundWhileIdle) {
+        FreezeBackgroundWhileIdle.enabled()
+    } else {
+        emptyMap()
+    }
     entry<T>(
         metadata = NavDisplay.transitionSpec {
             slideIntoContainer(
@@ -36,7 +49,7 @@ inline fun <reified T : NavKey> EntryProviderScope<NavKey>.swipeToDismissHorizon
                 targetContentEnter = EnterTransition.None,
                 initialContentExit = ExitTransition.None,
             )
-        } + SwipeToDismissSceneStrategy.enabled(),
+        } + SwipeToDismissSceneStrategy.enabled() + freezeMetadata,
         content = content,
     )
 }

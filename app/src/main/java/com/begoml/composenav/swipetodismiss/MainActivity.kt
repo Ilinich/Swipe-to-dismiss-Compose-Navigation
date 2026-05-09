@@ -24,16 +24,22 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
@@ -96,7 +102,9 @@ private fun SwipeDismissDemo() {
                 )
             }
 
-            swipeToDismissHorizontalEntry<DetailKey> { key ->
+            swipeToDismissHorizontalEntry<DetailKey>(
+                freezeBackgroundWhileIdle = true,
+            ) { key ->
                 DetailScreen(key = key)
             }
         },
@@ -108,6 +116,16 @@ private fun SwipeDismissDemo() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(onItemClick: (DetailKey) -> Unit) {
+    // Window-scoped side effect on (re)entering composition. With freezeBackgroundWhileIdle's
+    // legacy drop-from-composition implementation, this would fire on every awaitFirstDown in
+    // the foreground (Detail) and steal focus from any TextField the user just tapped.
+    // With the always-compose + skip-draw implementation it fires only once per Home lifetime
+    // and the foreground TextField keeps its focus / IME.
+    val focusManager = LocalFocusManager.current
+    LaunchedEffect(Unit) {
+        runCatching { focusManager.clearFocus() }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("Swipe to Dismiss Demo") })
@@ -204,6 +222,36 @@ private fun DetailScreen(key: DetailKey) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+
+            // Focus / IME demo. With freezeBackgroundWhileIdle = true on this entry and the
+            // always-compose + skip-draw implementation, tapping this field keeps the focus
+            // and the keyboard open between taps. A legacy drop-from-composition freeze would
+            // trigger HomeScreen's LaunchedEffect on each awaitFirstDown and clear focus here.
+            item {
+                var text by remember { mutableStateOf("") }
+                Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                    Text(
+                        text = "Focus / IME demo",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Tap the field — the keyboard must stay open between taps. " +
+                            "Background composition is alive but its draw + measure are skipped.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Type something") },
+                        singleLine = true,
+                    )
+                    Spacer(Modifier.height(16.dp))
                 }
             }
 

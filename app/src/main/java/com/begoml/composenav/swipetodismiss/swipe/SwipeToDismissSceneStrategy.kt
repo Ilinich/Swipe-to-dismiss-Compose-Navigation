@@ -49,6 +49,7 @@ class SwipeToDismissSceneStrategy : SceneStrategy<NavKey> {
             previousEntry = previousEntry,
             currentEntry = currentEntry,
             previousEntries = entries.dropLast(1),
+            freezeBackgroundWhileIdle = FreezeBackgroundWhileIdle.isEnabledIn(currentEntry.metadata),
             onBack = onBack,
         )
     }
