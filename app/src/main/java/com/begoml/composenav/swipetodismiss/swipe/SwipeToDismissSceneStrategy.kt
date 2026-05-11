@@ -5,7 +5,6 @@ import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.scene.Scene
 import androidx.navigation3.scene.SceneStrategy
 import androidx.navigation3.scene.SceneStrategyScope
-import kotlin.text.get
 
 /**
  * [SceneStrategy] that intercepts navigation entries marked with [enabled] metadata
@@ -50,6 +49,9 @@ class SwipeToDismissSceneStrategy : SceneStrategy<NavKey> {
             currentEntry = currentEntry,
             previousEntries = entries.dropLast(1),
             freezeBackgroundWhileIdle = FreezeBackgroundWhileIdle.isEnabledIn(currentEntry.metadata),
+            edgeWidthDp = SwipeEdgeGate.edgeWidthDp(currentEntry.metadata),
+            swipeFromAnywhere = SwipeEdgeGate.isSwipeFromAnywhere(currentEntry.metadata),
+            sensitivity = SwipeDismissSensitivity.from(currentEntry.metadata),
             onBack = onBack,
         )
     }
