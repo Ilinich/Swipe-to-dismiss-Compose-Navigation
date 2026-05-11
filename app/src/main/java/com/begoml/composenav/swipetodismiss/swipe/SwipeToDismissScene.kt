@@ -4,6 +4,7 @@ import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.unit.Dp
 import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.scene.Scene
@@ -14,7 +15,7 @@ import androidx.navigation3.ui.NavDisplay
  * the [previousEntry] as the background and the [currentEntry] as the swipeable foreground.
  *
  * Created by [SwipeToDismissSceneStrategy] when the top entry is marked with
- * [SwipeToDismissSceneStrategy.Companion.enabled].
+ * [SwipeToDismissSceneStrategy.enabled].
  *
  * Pop transitions are set to [EnterTransition.None] / [ExitTransition.None] because
  * the dismiss animation is handled entirely by [SwipeToDismissLayout] itself.
@@ -25,6 +26,9 @@ internal data class SwipeToDismissScene(
     val currentEntry: NavEntry<NavKey>,
     override val previousEntries: List<NavEntry<NavKey>>,
     val freezeBackgroundWhileIdle: Boolean,
+    val edgeWidthDp: Dp?,
+    val swipeFromAnywhere: Boolean,
+    val sensitivity: SwipeSensitivity,
     val onBack: () -> Unit,
 ) : Scene<NavKey> {
 
@@ -36,6 +40,9 @@ internal data class SwipeToDismissScene(
             backgroundContent = { previousEntry.Content() },
             foregroundContent = { currentEntry.Content() },
             freezeBackgroundWhileIdle = freezeBackgroundWhileIdle,
+            edgeWidthDp = edgeWidthDp,
+            swipeFromAnywhere = swipeFromAnywhere,
+            sensitivity = sensitivity,
         )
     }
 
