@@ -1,6 +1,8 @@
 package com.begoml.composenav.swipetodismiss.swipe
 
 import androidx.compose.foundation.gestures.ScrollableState
+import androidx.compose.foundation.overscroll
+import androidx.compose.foundation.rememberOverscrollEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -35,6 +37,72 @@ fun Modifier.consumeHorizontalSwipeToDismiss(): Modifier {
         }
     }
     return this.nestedScroll(connection)
+}
+
+/**
+ * Consumes horizontal scroll/fling leftover from a child scrollable — like
+ * [consumeHorizontalSwipeToDismiss] — but renders the leftover as an edge overscroll instead of
+ * dropping it. Use for a full-screen media viewer where reaching the edge must look like bumping
+ * into a wall rather than like a dead stop.
+ *
+ * Plain consumption cannot produce that animation. Compose dispatches nested-scroll leftover to
+ * parents *inside* `OverscrollEffect.applyToScroll`, and the child's edge effect only receives
+ * `delta - consumedByEveryone`, so whatever this connection takes is exactly what the child's
+ * overscroll loses. Nor can a connection abstain from forwarding: `NestedScrollNode.onPostScroll`
+ * always passes `available - selfConsumed` to the ancestor it finds by tree lookup. The leftover
+ * is therefore taken here and fed to an overscroll effect owned by this modifier, which renders
+ * it over the whole decorated area.
+ *
+ * Because the effect lives outside the child, the child no longer relaxes it when the gesture
+ * reverses — a reversed drag is fully consumed by the child and never reaches `onPostScroll`.
+ * `onPreScroll` restores that: while the effect is showing, the incoming delta is offered to it
+ * first, and only the part it did not take is passed on to the child. The `performScroll` lambda
+ * echoes what it receives so the effect treats the remainder as consumed and does not start
+ * pulling the opposite edge.
+ *
+ * The decorated node must have a non-empty size (e.g. `fillMaxSize()`), otherwise the effect
+ * skips rendering.
+ */
+@Composable
+fun Modifier.consumeHorizontalSwipeToDismissWithOverscroll(): Modifier {
+    val effect = rememberOverscrollEffect()
+    val connection = remember(effect) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (effect == null || !effect.isInProgress) return Offset.Zero
+                if (source != NestedScrollSource.UserInput || available.x == 0f) return Offset.Zero
+                var passThrough = Offset.Zero
+                effect.applyToScroll(Offset(available.x, 0f), source) { remaining ->
+                    passThrough = remaining
+                    remaining
+                }
+                return Offset(available.x - passThrough.x, 0f)
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source != NestedScrollSource.UserInput || available.x == 0f) return Offset.Zero
+                val leftover = Offset(available.x, 0f)
+                effect?.applyToScroll(leftover, source) { Offset.Zero }
+                return leftover
+            }
+
+            override suspend fun onPostFling(
+                consumed: Velocity,
+                available: Velocity,
+            ): Velocity {
+                val leftover = Velocity(available.x, 0f)
+                effect?.applyToFling(leftover) { Velocity.Zero }
+                return leftover
+            }
+        }
+    }
+    return this
+        .nestedScroll(connection)
+        .overscroll(effect)
 }
 
 /**
