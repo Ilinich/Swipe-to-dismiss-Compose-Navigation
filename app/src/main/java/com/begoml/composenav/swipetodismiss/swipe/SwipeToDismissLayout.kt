@@ -139,6 +139,7 @@ internal fun SwipeToDismissLayout(
         LocalConfiguration.current.screenWidthDp.dp.toPx()
     }
     val keyboardController = LocalSoftwareKeyboardController.current
+    val isPredictiveBackInProgress by rememberPredictiveBackInProgress()
     val view = LocalView.current
     val insets = view.rootWindowInsets
     val deviceCornerRadiusDp = remember(insets) {
@@ -382,6 +383,10 @@ internal fun SwipeToDismissLayout(
                             }
                         }
                         .drawWithContent {
+                            // During predictive back NavDisplay reveals the real previous scene
+                            // underneath; drawing this copy too would show the same screen twice,
+                            // travelling with the outgoing foreground.
+                            if (isPredictiveBackInProgress) return@drawWithContent
                             if (isFullyCoveredByForeground) {
                                 // Foreground fully covers the screen — skip CPU display-list
                                 // issuance + GPU layer playback. Composition stays alive, but
@@ -411,7 +416,7 @@ internal fun SwipeToDismissLayout(
                 Spacer(
                     modifier = Modifier
                         .fillMaxSize()
-                        .drawBehind { drawLayer(backgroundLayer) }
+                        .drawBehind { if (!isPredictiveBackInProgress) drawLayer(backgroundLayer) }
                 )
             }
         }
@@ -448,6 +453,10 @@ internal fun SwipeToDismissLayout(
                             else -> Float.MAX_VALUE
                         }
                         if (down.position.x > effectiveEdge) return@awaitEachGesture
+                        // The system predictive-back gesture already seeks this scene through
+                        // NavDisplay; claiming the same touch stream here would transform the
+                        // screen twice (NavDisplay offset + dragOffset).
+                        if (isPredictiveBackInProgress) return@awaitEachGesture
 
                         var slopOver = 0f
                         val drag: PointerInputChange = awaitHorizontalTouchSlopOrCancellation(
