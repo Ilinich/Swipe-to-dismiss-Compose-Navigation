@@ -4,7 +4,9 @@ import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.unit.Dp
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.scene.Scene
@@ -19,6 +21,9 @@ import androidx.navigation3.ui.NavDisplay
  *
  * Pop transitions are set to [EnterTransition.None] / [ExitTransition.None] because
  * the dismiss animation is handled entirely by [SwipeToDismissLayout] itself.
+ *
+ * The background entry is hosted under a [rememberCappedLifecycleOwner] so it never observes
+ * `RESUMED` while it is only being rendered for the parallax.
  *
  * When [LocalSwipeGestureAvailable] is `false`, the layout is bypassed entirely: only
  * [currentEntry] is composed, no gesture handler / GraphicsLayer is allocated. The push slide
@@ -45,7 +50,11 @@ internal data class SwipeToDismissScene(
         } else {
             SwipeToDismissLayout(
                 onDismiss = onBack,
-                backgroundContent = { previousEntry.Content() },
+                backgroundContent = {
+                    CompositionLocalProvider(LocalLifecycleOwner provides rememberCappedLifecycleOwner()) {
+                        previousEntry.Content()
+                    }
+                },
                 foregroundContent = { currentEntry.Content() },
                 freezeBackgroundWhileIdle = freezeBackgroundWhileIdle,
                 edgeWidthDp = edgeWidthDp,
