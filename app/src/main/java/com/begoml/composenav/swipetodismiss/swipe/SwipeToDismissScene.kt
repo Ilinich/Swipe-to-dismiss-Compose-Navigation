@@ -19,6 +19,11 @@ import androidx.navigation3.ui.NavDisplay
  *
  * Pop transitions are set to [EnterTransition.None] / [ExitTransition.None] because
  * the dismiss animation is handled entirely by [SwipeToDismissLayout] itself.
+ *
+ * When [LocalSwipeGestureAvailable] is `false`, the layout is bypassed entirely: only
+ * [currentEntry] is composed, no gesture handler / GraphicsLayer is allocated. The push slide
+ * animation still plays via NavDisplay's transitionSpec metadata. Back navigation then works
+ * only via the system back button.
  */
 internal data class SwipeToDismissScene(
     override val key: Any,
@@ -35,15 +40,19 @@ internal data class SwipeToDismissScene(
     override val entries: List<NavEntry<NavKey>> = listOf(currentEntry)
 
     override val content: @Composable () -> Unit = {
-        SwipeToDismissLayout(
-            onDismiss = onBack,
-            backgroundContent = { previousEntry.Content() },
-            foregroundContent = { currentEntry.Content() },
-            freezeBackgroundWhileIdle = freezeBackgroundWhileIdle,
-            edgeWidthDp = edgeWidthDp,
-            swipeFromAnywhere = swipeFromAnywhere,
-            sensitivity = sensitivity,
-        )
+        if (!LocalSwipeGestureAvailable.current) {
+            currentEntry.Content()
+        } else {
+            SwipeToDismissLayout(
+                onDismiss = onBack,
+                backgroundContent = { previousEntry.Content() },
+                foregroundContent = { currentEntry.Content() },
+                freezeBackgroundWhileIdle = freezeBackgroundWhileIdle,
+                edgeWidthDp = edgeWidthDp,
+                swipeFromAnywhere = swipeFromAnywhere,
+                sensitivity = sensitivity,
+            )
+        }
     }
 
     override val metadata: Map<String, Any> =
