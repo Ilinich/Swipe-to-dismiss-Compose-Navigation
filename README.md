@@ -9,20 +9,20 @@ iOS-style swipe-to-dismiss navigation for Jetpack Compose Navigation 3.
 ## What it demonstrates
 
 - Horizontal swipe gesture to navigate back (drag from left edge or flick right)
-- Nested scroll integration — scroll a `LazyColumn` to the top, keep pulling right, and the dismiss gesture kicks in automatically
+- Nested scroll integration — scroll a `LazyColumn` to the top, keep pulling right, and the dismiss gesture kicks in automatically. A horizontal child (`LazyRow`, `HorizontalPager`) keeps its own gesture until it actually reaches its edge
 - Visual feedback during swipe: translation, scale (1.0 → 0.95), alpha fade, progressive corner rounding
 - Background parallax effect on the previous screen
 - `GraphicsLayer` caching to avoid `movableContentOf` conflicts and freeze position-aware effects (e.g. Haze blur) during the gesture
 - Keyboard-aware: first swipe hides the IME, second one starts the dismiss
 - Velocity-based dismiss — a fast flick (≥ 1500 dp/s) dismisses regardless of distance
-- **Background freeze (opt-in)**: when a foreground is fully opaque and idle, the background's CPU draw, GPU draw and measure pass are skipped while its composition stays alive. Eliminates per-frame work for the hidden screen without tearing down its `LaunchedEffect` / `DisposableEffect` (which would otherwise misbehave on every foreground touch — e.g. clearing focus and dismissing the IME).
+- **Background freeze (opt-in)**: when a foreground is fully opaque and idle, the background's CPU draw and GPU draw are skipped while its composition stays alive. Eliminates per-frame work for the hidden screen without tearing down its `LaunchedEffect` / `DisposableEffect` (which would otherwise misbehave on every foreground touch — e.g. clearing focus and dismissing the IME). Measure and layout are deliberately **not** skipped — see below.
 
 ## One-line API
 
 ```kotlin
 swipeToDismissHorizontalEntry<DetailKey> { key -> DetailScreen(key) }
 
-// Opt-in background freeze (skip draw + measure for the hidden screen):
+// Opt-in background freeze (skip draw for the hidden screen):
 swipeToDismissHorizontalEntry<DetailKey>(freezeBackgroundWhileIdle = true) { key ->
     DetailScreen(key)
 }
@@ -37,6 +37,7 @@ swipe/
 ├── SwipeToDismissLayout.kt          — Core composable: gesture, animation, GraphicsLayer caching
 ├── SwipeToDismissEntry.kt           — DSL extension for one-line entry registration
 ├── FreezeDuringSwipeToDismiss.kt    — Modifier to freeze position-aware effects during swipe
+├── NestedScrollSwipeArbiter.kt      — Decides whether a nested-scroll gesture is a dismiss
 └── FreezeBackgroundWhileIdle.kt     — Metadata helper for the opt-in background freeze flag
 ```
 
@@ -48,13 +49,21 @@ When the foreground entry is fully opaque and covers the screen, the background 
 |---|---|
 | CPU draw (`record`) | display-list issuance for the background subtree |
 | GPU draw (`drawLayer`) | layer playback in the backbuffer |
-| Measure / Layout | children of the background are not measured |
+
+**Measure and layout are deliberately not skipped.** An earlier version of this
+project also returned a size without measuring the children. It is a tempting
+trade and it is a bad one: taking a subtree out of the placed state costs far
+more to restore than the measure work it avoids. Measured on a production app,
+skipping measure saved ~0.16 ms per idle frame and cost ~8.1 ms of re-placement
+on the very next touch — so every finger-down on a swipe screen dropped a frame.
+Freezing draw alone is what actually pays, and once the subtree is never
+unplaced, nothing invalidates its layout in the first place.
 
 What is **not** dropped: composition. `LaunchedEffect`, `DisposableEffect` and state holders of the background remain alive across foreground touches. This avoids a class of regressions where re-creating the background subtree on every `awaitFirstDown` re-fires window-scoped side effects (e.g. `focusManager.clearFocus()`) and breaks foreground UX (input focus, IME, snackbar host).
 
 Invariants:
 - Foreground must be opaque and full-screen — semi-transparent foregrounds will see a black background while idle.
-- Background size-aware callbacks (`onSizeChanged`, `onGloballyPositioned`, `onPlaced`) must guard against zero size to remain idempotent across measure-skip cycles.
+- Only content whose visible output is produced outside the recorded layer, or which advances from its own draw callback, is affected by the draw freeze. A plain Compose animation in the background is not: composition and the frame clock keep running, `record` resumes on `awaitFirstDown`, and the frame that exposes the background already shows current content.
 
 The demo in this repo uses `freezeBackgroundWhileIdle = true` on `DetailKey`, with a `LaunchedEffect { focusManager.clearFocus() }` in `HomeScreen` and a `TextField` in `DetailScreen`. With the always-compose implementation the keyboard stays open between taps; a legacy drop-from-composition freeze would dismiss it on every tap.
 
