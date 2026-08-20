@@ -42,7 +42,6 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -82,13 +81,16 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  *    into a [GraphicsLayer] while the scene is RESUMED. Once a dismiss starts or the scene
  *    transitions to STARTED (pop), composition of [backgroundContent] stops and the cached
  *    snapshot is replayed. This avoids `movableContentOf` conflicts with `SinglePaneScene`.
- *    When [freezeBackgroundWhileIdle] is `true`, the background's CPU draw (`record`), GPU
- *    draw (`drawLayer`) and measure pass are skipped during RESUMED-idle while a snapshot
- *    already exists. Background composition stays alive — its `LaunchedEffect` /
+ *    When [freezeBackgroundWhileIdle] is `true`, the background's CPU draw (`record`) and GPU
+ *    draw (`drawLayer`) are skipped during RESUMED-idle while a snapshot already exists.
+ *    Measure and placement are never skipped: taking a subtree out of the placed state costs
+ *    far more to undo than the measure work it saves, and the frame that first exposes the
+ *    background must not be the frame that re-places it.
+ *    Background composition stays alive — its `LaunchedEffect` /
  *    `DisposableEffect` are not disposed, which prevents window-scoped side effects (focus,
  *    IME) from being torn down on every touch in the foreground. On first touch
- *    (`awaitFirstDown`) draw / measure resume so the layer is refreshed before parallax
- *    exposes the background.
+ *    (`awaitFirstDown`) draw resumes so the layer is refreshed before parallax exposes the
+ *    background.
  *
  * 2. **Foreground layer** — the current screen. The content is recorded into a [GraphicsLayer]
  *    snapshot lazily — only when a touch is detected (or after invalidation events like
@@ -364,24 +366,6 @@ internal fun SwipeToDismissLayout(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .layout { measurable, constraints ->
-                            if (isFullyCoveredByForeground) {
-                                // Skip measure for the background subtree — children are
-                                // invisible under the foreground, so we don't pay for measure
-                                // invalidations from background state ticks (paging, sync).
-                                // Returning full constraints as the layout size keeps parent
-                                // placement stable; no children are placed, so onPlaced /
-                                // onSizeChanged / onGloballyPositioned do not fire.
-                                // Background composables MUST guard size-dependent state against
-                                // zero size to remain idempotent across measure-skip cycles.
-                                layout(constraints.maxWidth, constraints.maxHeight) {}
-                            } else {
-                                val placeable = measurable.measure(constraints)
-                                layout(placeable.width, placeable.height) {
-                                    placeable.place(0, 0)
-                                }
-                            }
-                        }
                         .drawWithContent {
                             // During predictive back NavDisplay reveals the real previous scene
                             // underneath; drawing this copy too would show the same screen twice,
