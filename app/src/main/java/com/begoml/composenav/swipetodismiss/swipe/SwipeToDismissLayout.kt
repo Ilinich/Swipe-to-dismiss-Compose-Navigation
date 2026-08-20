@@ -46,6 +46,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Velocity
@@ -115,6 +116,11 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  * - Velocity-based dismiss: a fast flick (≥ the configured [SwipeSensitivity.velocityDp])
  *   dismisses regardless of distance.
  * - Background parallax: the previous screen shifts from −screenWidth/3 to 0 during swipe.
+ * - Nested-scroll arming (see [NestedScrollSwipeArbiter]): a descendant scrollable hands the
+ *   gesture over only when a finger is down, the accumulated `consumed + available` delta has
+ *   crossed the touch slop with a dominant rightward axis, and the descendant left a rightward
+ *   remainder. The verdict holds for the rest of the gesture, and only `onPreFling` ends it —
+ *   so every exit path settles `offsetX` and none can park the screen off-origin.
  * - Edge-gate: when [edgeWidthDp] is set, only down-events with `x <= edgePx` initiate the
  *   gesture; touches outside the zone propagate to children. [swipeFromAnywhere] disables
  *   this gate for screens like media gallery / image preview.
@@ -195,6 +201,7 @@ internal fun SwipeToDismissLayout(
     var dragOffset by remember { mutableFloatStateOf(0f) }
     var swipeConsumedByKeyboard by remember { mutableStateOf(false) }
     var isNestedScrollDragging by remember { mutableStateOf(false) }
+    var isTouchDown by remember { mutableStateOf(false) }
     var nestedScrollConsumedByKeyboard by remember { mutableStateOf(false) }
     // Marks the foreground snapshot as in need of refresh. Set synchronously by whichever
     // handler accepts a gesture, and on configuration change.
@@ -232,7 +239,10 @@ internal fun SwipeToDismissLayout(
         }
     }
 
-    val nestedScrollConnection = remember {
+    val touchSlop = LocalViewConfiguration.current.touchSlop
+    val arbiter = remember(touchSlop) { NestedScrollSwipeArbiter(touchSlop) }
+
+    val nestedScrollConnection = remember(arbiter) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (!isNestedScrollDragging || source != NestedScrollSource.UserInput) {
@@ -241,7 +251,6 @@ internal fun SwipeToDismissLayout(
                 val newOffset = (dragOffset + available.x).coerceAtLeast(0f)
                 val consumed = newOffset - dragOffset
                 dragOffset = newOffset
-                if (dragOffset == 0f) isNestedScrollDragging = false
                 return Offset(consumed, 0f)
             }
 
@@ -250,12 +259,15 @@ internal fun SwipeToDismissLayout(
                 available: Offset,
                 source: NestedScrollSource,
             ): Offset {
-                if (source != NestedScrollSource.UserInput || available.x <= 0f) {
-                    return Offset.Zero
-                }
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
                 if (isDragging || nestedScrollConsumedByKeyboard) return Offset.Zero
 
                 if (!isNestedScrollDragging) {
+                    if (!isTouchDown) return Offset.Zero
+                    if (!arbiter.shouldArm(consumed = consumed, available = available)) {
+                        return Offset.Zero
+                    }
+
                     val isImeVisible = ViewCompat.getRootWindowInsets(view)
                         ?.isVisible(WindowInsetsCompat.Type.ime()) == true
                     if (isImeVisible) {
@@ -265,13 +277,16 @@ internal fun SwipeToDismissLayout(
                     }
                     isNestedScrollDragging = true
                     foregroundSnapshotInvalid = true
-                    dragOffset = 0f
+                    animationJob?.cancel()
+                    dragOffset = offsetX.value
                 }
+                if (available.x <= 0f) return Offset.Zero
                 dragOffset = (dragOffset + available.x).coerceAtLeast(0f)
                 return Offset(available.x, 0f)
             }
 
             override suspend fun onPreFling(available: Velocity): Velocity {
+                arbiter.reset()
                 if (nestedScrollConsumedByKeyboard) {
                     nestedScrollConsumedByKeyboard = false
                     return Velocity.Zero
@@ -305,12 +320,7 @@ internal fun SwipeToDismissLayout(
     // Background freeze state (active only when freezeBackgroundWhileIdle = true).
     // hasBackgroundSnapshot: flips true once the first record() pass completes; gate for
     // switching from Live to Snapshot mode.
-    // isTouchDown: set on awaitFirstDown via a separate pointerInput on the foreground.
-    // Pre-warms Live mode before the touch-slop classifies the gesture as a horizontal drag,
-    // so a fresh snapshot is captured before the user's finger has moved enough for parallax
-    // to expose stale frames.
     var hasBackgroundSnapshot by remember { mutableStateOf(false) }
-    var isTouchDown by remember { mutableStateOf(false) }
 
     // Invalidate snapshot when configuration changes that affect rendering. Rotation triggers
     // full recomposition anyway; uiMode (light/dark), fontScale, locales can change without
@@ -425,6 +435,7 @@ internal fun SwipeToDismissLayout(
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         isTouchDown = true
+                        arbiter.reset()
                         try {
                             do {
                                 val event = awaitPointerEvent()
