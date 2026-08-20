@@ -93,12 +93,14 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  *    background.
  *
  * 2. **Foreground layer** — the current screen. The content is recorded into a [GraphicsLayer]
- *    snapshot lazily — only when a touch is detected (or after invalidation events like
- *    configuration changes). During pure idle (no touch), [drawContent] is called directly,
- *    avoiding the double-draw cost of always recording a layer that no one will replay.
- *    Once swiping begins (`progress > 0`), only the cached snapshot is drawn (no live
- *    recomposition of draw), which prevents Haze and other position-aware effects from
- *    recalculating against the moving coordinate space.
+ *    snapshot exactly once per accepted gesture (and after invalidation events like
+ *    configuration changes). While idle, [drawContent] is called directly, avoiding the
+ *    double-draw cost of recording a layer that no one will replay. Once a gesture is
+ *    accepted, only the cached snapshot is drawn (no live recomposition of draw), which
+ *    prevents Haze and other position-aware effects from recalculating against the moving
+ *    coordinate space. Recording takes precedence over replaying, so a snapshot invalidated
+ *    in the same frame the gesture is accepted is refreshed rather than replayed stale for
+ *    the whole swipe.
  *
  * ## Gesture handling
  *
@@ -185,6 +187,9 @@ internal fun SwipeToDismissLayout(
     var swipeConsumedByKeyboard by remember { mutableStateOf(false) }
     var isNestedScrollDragging by remember { mutableStateOf(false) }
     var nestedScrollConsumedByKeyboard by remember { mutableStateOf(false) }
+    // Marks the foreground snapshot as in need of refresh. Set synchronously by whichever
+    // handler accepts a gesture, and on configuration change.
+    var foregroundSnapshotInvalid by remember { mutableStateOf(false) }
     var isDismissed by remember { mutableStateOf(false) }
 
     // Single owning Job for any settle animation (spring-back / dismiss-throw).
@@ -251,6 +256,7 @@ internal fun SwipeToDismissLayout(
                         return Offset(available.x, 0f)
                     }
                     isNestedScrollDragging = true
+                    foregroundSnapshotInvalid = true
                     dragOffset = 0f
                 }
                 dragOffset = (dragOffset + available.x).coerceAtLeast(0f)
@@ -287,10 +293,6 @@ internal fun SwipeToDismissLayout(
     var hasBeenResumed by remember { mutableStateOf(false) }
     val backgroundLayer = rememberGraphicsLayer()
     val foregroundLayer = rememberGraphicsLayer()
-    var hasForegroundSnapshot by remember { mutableStateOf(false) }
-    // Marks the foreground snapshot as in need of refresh. Set on configuration change and
-    // on touch-down (so the next live draw refreshes the cache before the user starts swiping).
-    var foregroundSnapshotInvalid by remember { mutableStateOf(true) }
 
     // Background freeze state (active only when freezeBackgroundWhileIdle = true).
     // hasBackgroundSnapshot: flips true once the first record() pass completes; gate for
@@ -306,14 +308,14 @@ internal fun SwipeToDismissLayout(
     // full recomposition anyway; uiMode (light/dark), fontScale, locales can change without
     // recreating the activity, leaving a visually stale snapshot until the next swipe.
     val configuration = LocalConfiguration.current
+    var isInitialConfiguration by remember { mutableStateOf(true) }
     LaunchedEffect(configuration.uiMode, configuration.fontScale, configuration.locales) {
+        if (isInitialConfiguration) {
+            isInitialConfiguration = false
+            return@LaunchedEffect
+        }
         if (freezeBackgroundWhileIdle) hasBackgroundSnapshot = false
         foregroundSnapshotInvalid = true
-    }
-    // Also invalidate the foreground snapshot on touch-down so the cache is refreshed before
-    // the user starts swiping (in case background state ticked while idle).
-    LaunchedEffect(isTouchDown) {
-        if (isTouchDown) foregroundSnapshotInvalid = true
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -461,6 +463,7 @@ internal fun SwipeToDismissLayout(
                         } else {
                             animationJob?.cancel()
                             isDragging = true
+                            foregroundSnapshotInvalid = true
                             dragOffset = (offsetX.value + slopOver).coerceAtLeast(0f)
                             velocityTracker.resetTracking()
                             velocityTracker.addPosition(drag.uptimeMillis, drag.position)
@@ -536,16 +539,9 @@ internal fun SwipeToDismissLayout(
                 modifier = Modifier
                     .fillMaxSize()
                     .drawWithContent {
+                        val needsRecord = foregroundSnapshotInvalid
                         when {
-                            isSwiping && hasForegroundSnapshot -> {
-                                // Active swipe: replay snapshot only, no live draw of subtree.
-                                // Position-aware effects (Haze blur) won't recompute against
-                                // the moving coordinate space.
-                                drawLayer(foregroundLayer)
-                            }
-                            !isSwiping && (foregroundSnapshotInvalid || isTouchDown) -> {
-                                // Idle but snapshot is stale (config changed or touch just
-                                // arrived) — refresh the snapshot for the upcoming swipe.
+                            needsRecord -> {
                                 SwipeTrace.section("SwipeFg.record") {
                                     foregroundLayer.record(
                                         size = IntSize(size.width.toInt(), size.height.toInt()),
@@ -554,18 +550,10 @@ internal fun SwipeToDismissLayout(
                                     }
                                 }
                                 drawLayer(foregroundLayer)
-                                if (!hasForegroundSnapshot) hasForegroundSnapshot = true
-                                if (foregroundSnapshotInvalid) foregroundSnapshotInvalid = false
+                                foregroundSnapshotInvalid = false
                             }
-                            !isSwiping -> {
-                                // Pure idle, snapshot is fresh — direct draw, no layer overhead.
-                                drawContent()
-                            }
-                            else -> {
-                                // isSwiping && !hasForegroundSnapshot — swipe started before any
-                                // snapshot was captured. Fallback to live draw to avoid empty frame.
-                                drawContent()
-                            }
+                            isSwiping -> drawLayer(foregroundLayer)
+                            else -> drawContent()
                         }
                     }
             ) {
