@@ -125,6 +125,15 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  * which is cancelled before launching a new settle animation. This prevents races where a
  * spring-back coroutine continues to mutate `offsetX` while the user has already started a
  * new gesture.
+ *
+ * The cancel path mirrors the platform it imitates: a critically damped spring seeded with the
+ * gesture's own velocity, so the screen continues the finger's motion and decelerates into the
+ * origin without overshooting it. Overshoot here would not read as a rubber band — at a negative
+ * offset the foreground sits left of its home while the background is still parallaxed left, so
+ * the right edge of the window would show a gap. `offsetX` also carries a lower bound of `0f`,
+ * which only engages if a gesture is released while flicking left hard enough to cross the origin
+ * under its own momentum. With no overshoot, gesture state derived from `offset > 0f` settles once
+ * instead of oscillating, and no gesture-scoped flag has to be latched to compensate.
  */
 @Composable
 @Suppress("LongMethod", "CyclomaticComplexMethod", "LongParameterList")
@@ -174,7 +183,7 @@ internal fun SwipeToDismissLayout(
         edgeWidthDp?.let { with(density) { it.toPx() } }
     }
 
-    val offsetX = remember { Animatable(0f) }
+    val offsetX = remember { Animatable(0f).apply { updateBounds(lowerBound = 0f) } }
     val scope = rememberCoroutineScope()
     val dismissThreshold = screenWidth * sensitivity.distanceFraction
     val velocityDismissThreshold = with(density) { sensitivity.velocityDp.dp.toPx() }
@@ -207,9 +216,8 @@ internal fun SwipeToDismissLayout(
             } else {
                 offsetX.animateTo(
                     targetValue = 0f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                    ),
+                    animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy),
+                    initialVelocity = velocity,
                 )
             }
         }
