@@ -1,7 +1,6 @@
 package com.begoml.composenav.swipetodismiss.swipe
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -34,12 +33,12 @@ import androidx.compose.ui.unit.IntSize
 @Composable
 fun Modifier.freezeDuringSwipeToDismiss(): Modifier {
     val isSwiping = LocalSwipeToDismissActive.current
-    val isPredictiveBack by rememberPredictiveBackInProgress()
-    val isFrozen = isSwiping || isPredictiveBack
+    val isPredictiveBack = rememberPredictiveBackInProgress()
     val layer = rememberGraphicsLayer()
     val hasSnapshot = remember { mutableStateOf(false) }
     return this.then(
         Modifier.drawWithContent {
+            val isFrozen = isSwiping.value || isPredictiveBack.value
             if (!isFrozen) {
                 layer.record(
                     size = IntSize(size.width.toInt(), size.height.toInt()),

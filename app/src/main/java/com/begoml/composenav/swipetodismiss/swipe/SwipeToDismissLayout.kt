@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -67,8 +68,19 @@ import kotlinx.coroutines.launch
  * Consumers (e.g. [freezeDuringSwipeToDismiss]) read this to freeze their draw output
  * while the foreground is being translated/scaled, avoiding visual artifacts from
  * position-dependent effects like Haze blur.
+ *
+ * Carries a [State] rather than a `Boolean`, and the state instance is stable for the lifetime of
+ * the layout. Consumers need to *redraw* when a gesture starts, not to recompose: reading
+ * `value` inside a draw lambda invalidates draw alone. A `Boolean` here would change the value of
+ * the local itself on every gesture start and end, and because the local is `static` that
+ * invalidates the entire foreground subtree — every screen under the provider, not just the few
+ * modifiers that care.
  */
-val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
+private val SwipeInactive = object : State<Boolean> {
+    override val value: Boolean = false
+}
+
+val LocalSwipeToDismissActive = staticCompositionLocalOf<State<Boolean>> { SwipeInactive }
 
 /**
  * iOS-style swipe-to-dismiss layout that allows the user to drag the foreground screen
@@ -232,12 +244,13 @@ internal fun SwipeToDismissLayout(
 
     // Recomposition only on false↔true transition (swipe start/end), not every frame.
     // Per-frame offset/progress reads are deferred to graphicsLayer (draw phase only).
-    val isSwiping by remember {
+    val swipeActiveState = remember {
         derivedStateOf {
             val offset = if (isDragging || isNestedScrollDragging) dragOffset else offsetX.value
             offset > 0f
         }
     }
+    val isSwiping by swipeActiveState
 
     val touchSlop = LocalViewConfiguration.current.touchSlop
     val arbiter = remember(touchSlop) { NestedScrollSwipeArbiter(touchSlop) }
@@ -571,12 +584,12 @@ internal fun SwipeToDismissLayout(
                                 drawLayer(foregroundLayer)
                                 foregroundSnapshotInvalid = false
                             }
-                            isSwiping -> drawLayer(foregroundLayer)
+                            swipeActiveState.value -> drawLayer(foregroundLayer)
                             else -> drawContent()
                         }
                     }
             ) {
-                CompositionLocalProvider(LocalSwipeToDismissActive provides isSwiping) {
+                CompositionLocalProvider(LocalSwipeToDismissActive provides swipeActiveState) {
                     foregroundContent()
                 }
             }
