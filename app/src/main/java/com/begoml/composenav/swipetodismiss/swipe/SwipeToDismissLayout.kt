@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -42,11 +43,11 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Velocity
@@ -67,8 +68,19 @@ import kotlinx.coroutines.launch
  * Consumers (e.g. [freezeDuringSwipeToDismiss]) read this to freeze their draw output
  * while the foreground is being translated/scaled, avoiding visual artifacts from
  * position-dependent effects like Haze blur.
+ *
+ * Carries a [State] rather than a `Boolean`, and the state instance is stable for the lifetime of
+ * the layout. Consumers need to *redraw* when a gesture starts, not to recompose: reading
+ * `value` inside a draw lambda invalidates draw alone. A `Boolean` here would change the value of
+ * the local itself on every gesture start and end, and because the local is `static` that
+ * invalidates the entire foreground subtree — every screen under the provider, not just the few
+ * modifiers that care.
  */
-val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
+private val SwipeInactive = object : State<Boolean> {
+    override val value: Boolean = false
+}
+
+val LocalSwipeToDismissActive = staticCompositionLocalOf<State<Boolean>> { SwipeInactive }
 
 /**
  * iOS-style swipe-to-dismiss layout that allows the user to drag the foreground screen
@@ -82,21 +94,26 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  *    into a [GraphicsLayer] while the scene is RESUMED. Once a dismiss starts or the scene
  *    transitions to STARTED (pop), composition of [backgroundContent] stops and the cached
  *    snapshot is replayed. This avoids `movableContentOf` conflicts with `SinglePaneScene`.
- *    When [freezeBackgroundWhileIdle] is `true`, the background's CPU draw (`record`), GPU
- *    draw (`drawLayer`) and measure pass are skipped during RESUMED-idle while a snapshot
- *    already exists. Background composition stays alive — its `LaunchedEffect` /
+ *    When [freezeBackgroundWhileIdle] is `true`, the background's CPU draw (`record`) and GPU
+ *    draw (`drawLayer`) are skipped during RESUMED-idle while a snapshot already exists.
+ *    Measure and placement are never skipped: taking a subtree out of the placed state costs
+ *    far more to undo than the measure work it saves, and the frame that first exposes the
+ *    background must not be the frame that re-places it.
+ *    Background composition stays alive — its `LaunchedEffect` /
  *    `DisposableEffect` are not disposed, which prevents window-scoped side effects (focus,
  *    IME) from being torn down on every touch in the foreground. On first touch
- *    (`awaitFirstDown`) draw / measure resume so the layer is refreshed before parallax
- *    exposes the background.
+ *    (`awaitFirstDown`) draw resumes so the layer is refreshed before parallax exposes the
+ *    background.
  *
  * 2. **Foreground layer** — the current screen. The content is recorded into a [GraphicsLayer]
- *    snapshot lazily — only when a touch is detected (or after invalidation events like
- *    configuration changes). During pure idle (no touch), [drawContent] is called directly,
- *    avoiding the double-draw cost of always recording a layer that no one will replay.
- *    Once swiping begins (`progress > 0`), only the cached snapshot is drawn (no live
- *    recomposition of draw), which prevents Haze and other position-aware effects from
- *    recalculating against the moving coordinate space.
+ *    snapshot exactly once per accepted gesture (and after invalidation events like
+ *    configuration changes). While idle, [drawContent] is called directly, avoiding the
+ *    double-draw cost of recording a layer that no one will replay. Once a gesture is
+ *    accepted, only the cached snapshot is drawn (no live recomposition of draw), which
+ *    prevents Haze and other position-aware effects from recalculating against the moving
+ *    coordinate space. Recording takes precedence over replaying, so a snapshot invalidated
+ *    in the same frame the gesture is accepted is refreshed rather than replayed stale for
+ *    the whole swipe.
  *
  * ## Gesture handling
  *
@@ -111,6 +128,11 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  * - Velocity-based dismiss: a fast flick (≥ the configured [SwipeSensitivity.velocityDp])
  *   dismisses regardless of distance.
  * - Background parallax: the previous screen shifts from −screenWidth/3 to 0 during swipe.
+ * - Nested-scroll arming (see [NestedScrollSwipeArbiter]): a descendant scrollable hands the
+ *   gesture over only when a finger is down, the accumulated `consumed + available` delta has
+ *   crossed the touch slop with a dominant rightward axis, and the descendant left a rightward
+ *   remainder. The verdict holds for the rest of the gesture, and only `onPreFling` ends it —
+ *   so every exit path settles `offsetX` and none can park the screen off-origin.
  * - Edge-gate: when [edgeWidthDp] is set, only down-events with `x <= edgePx` initiate the
  *   gesture; touches outside the zone propagate to children. [swipeFromAnywhere] disables
  *   this gate for screens like media gallery / image preview.
@@ -121,6 +143,15 @@ val LocalSwipeToDismissActive = staticCompositionLocalOf { false }
  * which is cancelled before launching a new settle animation. This prevents races where a
  * spring-back coroutine continues to mutate `offsetX` while the user has already started a
  * new gesture.
+ *
+ * The cancel path mirrors the platform it imitates: a critically damped spring seeded with the
+ * gesture's own velocity, so the screen continues the finger's motion and decelerates into the
+ * origin without overshooting it. Overshoot here would not read as a rubber band — at a negative
+ * offset the foreground sits left of its home while the background is still parallaxed left, so
+ * the right edge of the window would show a gap. `offsetX` also carries a lower bound of `0f`,
+ * which only engages if a gesture is released while flicking left hard enough to cross the origin
+ * under its own momentum. With no overshoot, gesture state derived from `offset > 0f` settles once
+ * instead of oscillating, and no gesture-scoped flag has to be latched to compensate.
  */
 @Composable
 @Suppress("LongMethod", "CyclomaticComplexMethod", "LongParameterList")
@@ -170,7 +201,7 @@ internal fun SwipeToDismissLayout(
         edgeWidthDp?.let { with(density) { it.toPx() } }
     }
 
-    val offsetX = remember { Animatable(0f) }
+    val offsetX = remember { Animatable(0f).apply { updateBounds(lowerBound = 0f) } }
     val scope = rememberCoroutineScope()
     val dismissThreshold = screenWidth * sensitivity.distanceFraction
     val velocityDismissThreshold = with(density) { sensitivity.velocityDp.dp.toPx() }
@@ -182,7 +213,11 @@ internal fun SwipeToDismissLayout(
     var dragOffset by remember { mutableFloatStateOf(0f) }
     var swipeConsumedByKeyboard by remember { mutableStateOf(false) }
     var isNestedScrollDragging by remember { mutableStateOf(false) }
+    var isTouchDown by remember { mutableStateOf(false) }
     var nestedScrollConsumedByKeyboard by remember { mutableStateOf(false) }
+    // Marks the foreground snapshot as in need of refresh. Set synchronously by whichever
+    // handler accepts a gesture, and on configuration change.
+    var foregroundSnapshotInvalid by remember { mutableStateOf(false) }
     var isDismissed by remember { mutableStateOf(false) }
 
     // Single owning Job for any settle animation (spring-back / dismiss-throw).
@@ -200,9 +235,8 @@ internal fun SwipeToDismissLayout(
             } else {
                 offsetX.animateTo(
                     targetValue = 0f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                    ),
+                    animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy),
+                    initialVelocity = velocity,
                 )
             }
         }
@@ -210,14 +244,18 @@ internal fun SwipeToDismissLayout(
 
     // Recomposition only on false↔true transition (swipe start/end), not every frame.
     // Per-frame offset/progress reads are deferred to graphicsLayer (draw phase only).
-    val isSwiping by remember {
+    val swipeActiveState = remember {
         derivedStateOf {
             val offset = if (isDragging || isNestedScrollDragging) dragOffset else offsetX.value
             offset > 0f
         }
     }
+    val isSwiping by swipeActiveState
 
-    val nestedScrollConnection = remember {
+    val touchSlop = LocalViewConfiguration.current.touchSlop
+    val arbiter = remember(touchSlop) { NestedScrollSwipeArbiter(touchSlop) }
+
+    val nestedScrollConnection = remember(arbiter) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (!isNestedScrollDragging || source != NestedScrollSource.UserInput) {
@@ -226,7 +264,6 @@ internal fun SwipeToDismissLayout(
                 val newOffset = (dragOffset + available.x).coerceAtLeast(0f)
                 val consumed = newOffset - dragOffset
                 dragOffset = newOffset
-                if (dragOffset == 0f) isNestedScrollDragging = false
                 return Offset(consumed, 0f)
             }
 
@@ -235,12 +272,15 @@ internal fun SwipeToDismissLayout(
                 available: Offset,
                 source: NestedScrollSource,
             ): Offset {
-                if (source != NestedScrollSource.UserInput || available.x <= 0f) {
-                    return Offset.Zero
-                }
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
                 if (isDragging || nestedScrollConsumedByKeyboard) return Offset.Zero
 
                 if (!isNestedScrollDragging) {
+                    if (!isTouchDown) return Offset.Zero
+                    if (!arbiter.shouldArm(consumed = consumed, available = available)) {
+                        return Offset.Zero
+                    }
+
                     val isImeVisible = ViewCompat.getRootWindowInsets(view)
                         ?.isVisible(WindowInsetsCompat.Type.ime()) == true
                     if (isImeVisible) {
@@ -249,13 +289,17 @@ internal fun SwipeToDismissLayout(
                         return Offset(available.x, 0f)
                     }
                     isNestedScrollDragging = true
-                    dragOffset = 0f
+                    foregroundSnapshotInvalid = true
+                    animationJob?.cancel()
+                    dragOffset = offsetX.value
                 }
+                if (available.x <= 0f) return Offset.Zero
                 dragOffset = (dragOffset + available.x).coerceAtLeast(0f)
                 return Offset(available.x, 0f)
             }
 
             override suspend fun onPreFling(available: Velocity): Velocity {
+                arbiter.reset()
                 if (nestedScrollConsumedByKeyboard) {
                     nestedScrollConsumedByKeyboard = false
                     return Velocity.Zero
@@ -285,33 +329,24 @@ internal fun SwipeToDismissLayout(
     var hasBeenResumed by remember { mutableStateOf(false) }
     val backgroundLayer = rememberGraphicsLayer()
     val foregroundLayer = rememberGraphicsLayer()
-    var hasForegroundSnapshot by remember { mutableStateOf(false) }
-    // Marks the foreground snapshot as in need of refresh. Set on configuration change and
-    // on touch-down (so the next live draw refreshes the cache before the user starts swiping).
-    var foregroundSnapshotInvalid by remember { mutableStateOf(true) }
 
     // Background freeze state (active only when freezeBackgroundWhileIdle = true).
     // hasBackgroundSnapshot: flips true once the first record() pass completes; gate for
     // switching from Live to Snapshot mode.
-    // isTouchDown: set on awaitFirstDown via a separate pointerInput on the foreground.
-    // Pre-warms Live mode before the touch-slop classifies the gesture as a horizontal drag,
-    // so a fresh snapshot is captured before the user's finger has moved enough for parallax
-    // to expose stale frames.
     var hasBackgroundSnapshot by remember { mutableStateOf(false) }
-    var isTouchDown by remember { mutableStateOf(false) }
 
     // Invalidate snapshot when configuration changes that affect rendering. Rotation triggers
     // full recomposition anyway; uiMode (light/dark), fontScale, locales can change without
     // recreating the activity, leaving a visually stale snapshot until the next swipe.
     val configuration = LocalConfiguration.current
+    var isInitialConfiguration by remember { mutableStateOf(true) }
     LaunchedEffect(configuration.uiMode, configuration.fontScale, configuration.locales) {
+        if (isInitialConfiguration) {
+            isInitialConfiguration = false
+            return@LaunchedEffect
+        }
         if (freezeBackgroundWhileIdle) hasBackgroundSnapshot = false
         foregroundSnapshotInvalid = true
-    }
-    // Also invalidate the foreground snapshot on touch-down so the cache is refreshed before
-    // the user starts swiping (in case background state ticked while idle).
-    LaunchedEffect(isTouchDown) {
-        if (isTouchDown) foregroundSnapshotInvalid = true
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -364,24 +399,6 @@ internal fun SwipeToDismissLayout(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .layout { measurable, constraints ->
-                            if (isFullyCoveredByForeground) {
-                                // Skip measure for the background subtree — children are
-                                // invisible under the foreground, so we don't pay for measure
-                                // invalidations from background state ticks (paging, sync).
-                                // Returning full constraints as the layout size keeps parent
-                                // placement stable; no children are placed, so onPlaced /
-                                // onSizeChanged / onGloballyPositioned do not fire.
-                                // Background composables MUST guard size-dependent state against
-                                // zero size to remain idempotent across measure-skip cycles.
-                                layout(constraints.maxWidth, constraints.maxHeight) {}
-                            } else {
-                                val placeable = measurable.measure(constraints)
-                                layout(placeable.width, placeable.height) {
-                                    placeable.place(0, 0)
-                                }
-                            }
-                        }
                         .drawWithContent {
                             // During predictive back NavDisplay reveals the real previous scene
                             // underneath; drawing this copy too would show the same screen twice,
@@ -431,6 +448,7 @@ internal fun SwipeToDismissLayout(
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         isTouchDown = true
+                        arbiter.reset()
                         try {
                             do {
                                 val event = awaitPointerEvent()
@@ -477,6 +495,7 @@ internal fun SwipeToDismissLayout(
                         } else {
                             animationJob?.cancel()
                             isDragging = true
+                            foregroundSnapshotInvalid = true
                             dragOffset = (offsetX.value + slopOver).coerceAtLeast(0f)
                             velocityTracker.resetTracking()
                             velocityTracker.addPosition(drag.uptimeMillis, drag.position)
@@ -552,16 +571,9 @@ internal fun SwipeToDismissLayout(
                 modifier = Modifier
                     .fillMaxSize()
                     .drawWithContent {
+                        val needsRecord = foregroundSnapshotInvalid
                         when {
-                            isSwiping && hasForegroundSnapshot -> {
-                                // Active swipe: replay snapshot only, no live draw of subtree.
-                                // Position-aware effects (Haze blur) won't recompute against
-                                // the moving coordinate space.
-                                drawLayer(foregroundLayer)
-                            }
-                            !isSwiping && (foregroundSnapshotInvalid || isTouchDown) -> {
-                                // Idle but snapshot is stale (config changed or touch just
-                                // arrived) — refresh the snapshot for the upcoming swipe.
+                            needsRecord -> {
                                 SwipeTrace.section("SwipeFg.record") {
                                     foregroundLayer.record(
                                         size = IntSize(size.width.toInt(), size.height.toInt()),
@@ -570,22 +582,14 @@ internal fun SwipeToDismissLayout(
                                     }
                                 }
                                 drawLayer(foregroundLayer)
-                                if (!hasForegroundSnapshot) hasForegroundSnapshot = true
-                                if (foregroundSnapshotInvalid) foregroundSnapshotInvalid = false
+                                foregroundSnapshotInvalid = false
                             }
-                            !isSwiping -> {
-                                // Pure idle, snapshot is fresh — direct draw, no layer overhead.
-                                drawContent()
-                            }
-                            else -> {
-                                // isSwiping && !hasForegroundSnapshot — swipe started before any
-                                // snapshot was captured. Fallback to live draw to avoid empty frame.
-                                drawContent()
-                            }
+                            swipeActiveState.value -> drawLayer(foregroundLayer)
+                            else -> drawContent()
                         }
                     }
             ) {
-                CompositionLocalProvider(LocalSwipeToDismissActive provides isSwiping) {
+                CompositionLocalProvider(LocalSwipeToDismissActive provides swipeActiveState) {
                     foregroundContent()
                 }
             }
